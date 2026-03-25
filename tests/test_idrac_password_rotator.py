@@ -1,9 +1,31 @@
 import sys
+import types
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import pytest
+
+# Provide minimal hvac stub for offline test environments.
+hvac_stub = types.ModuleType("hvac")
+hvac_exceptions_stub = types.ModuleType("hvac.exceptions")
+
+
+class _InvalidPath(Exception):
+    pass
+
+
+class _VaultError(Exception):
+    pass
+
+
+hvac_exceptions_stub.InvalidPath = _InvalidPath
+hvac_exceptions_stub.VaultError = _VaultError
+hvac_stub.exceptions = hvac_exceptions_stub
+hvac_stub.Client = object
+sys.modules.setdefault("hvac", hvac_stub)
+sys.modules.setdefault("hvac.exceptions", hvac_exceptions_stub)
 
 import idrac_password_rotator as rot
 
@@ -116,3 +138,59 @@ def test_partial_failure_vault_write() -> None:
     assert result.status == "CRITICAL_PARTIAL_FAILURE"
     assert result.idrac_password_changed
     assert not result.vault_updated
+
+
+def test_process_dry_run_without_vault_client() -> None:
+    record = mk_record()
+    result = rot.process_one_server(
+        record=record,
+        dry_run=True,
+        timeout_seconds=5,
+        password_length=16,
+        password_specials="!@#",
+        vault_client=None,
+    )
+    assert result.status == "DRY_RUN_SKIPPED"
+
+
+def test_orchestrate_fail_fast_stops_after_first_failure(monkeypatch, tmp_path: Path) -> None:
+    csv_path = tmp_path / "in.csv"
+    csv_path.write_text(
+        "idrac_host,idrac_username,current_password_vault_path,target_account_username,target_account_id,new_password_vault_path,site,environment\n"
+        "h1,root,a,root,2,b,dc1,prod\n"
+        "h2,root,a2,root,2,b2,dc1,prod\n",
+        encoding="utf-8",
+    )
+
+    calls = {"n": 0}
+
+    def fake_process_one_server(**kwargs):
+        calls["n"] += 1
+        rec = kwargs["record"]
+        if calls["n"] == 1:
+            return rot.make_result(rec, status="FAILED", remediation_note="x")
+        return rot.make_result(rec, status="SUCCESS")
+
+    monkeypatch.setattr(rot, "process_one_server", fake_process_one_server)
+
+    args = SimpleNamespace(
+        input_file=str(csv_path),
+        dry_run=True,
+        limit=None,
+        concurrency=4,
+        timeout=30,
+        verbose=False,
+        report_file=str(tmp_path / "report"),
+        resume_from_report=None,
+        password_length=16,
+        vault_mount="secret",
+        fail_fast=True,
+        site_filter=None,
+        environment_filter=None,
+        password_specials="!@#",
+        vault_password_key="password",
+    )
+
+    rc = rot.orchestrate(args)
+    assert rc == 1
+    assert calls["n"] == 1

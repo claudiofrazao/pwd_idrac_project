@@ -227,6 +227,10 @@ class VaultKv2Client:
             raise ValueError("Vault authentication failed")
 
     def read_password(self, path: str) -> str:
+        value, _ = self.read_password_with_version(path)
+        return value
+
+    def read_password_with_version(self, path: str) -> Tuple[str, int]:
         try:
             response = self.client.secrets.kv.v2.read_secret_version(
                 path=path,
@@ -237,18 +241,46 @@ class VaultKv2Client:
         except VaultError as exc:
             raise ValueError(f"Vault read failed for path: {path}") from exc
 
-        data = response.get("data", {}).get("data", {})
+        data_block = response.get("data", {})
+        data = data_block.get("data", {})
+        metadata = data_block.get("metadata", {})
         value = data.get(self.password_key)
         if not isinstance(value, str) or not value:
             raise ValueError(f"Vault secret missing key '{self.password_key}' at path: {path}")
-        return value
+        version = metadata.get("version")
+        if not isinstance(version, int) or version < 1:
+            raise ValueError(f"Vault metadata missing valid version at path: {path}")
+        return value, version
 
     def write_password(self, path: str, new_password: str) -> None:
+        cas: Optional[int]
+        base_secret: Dict[str, object]
+        try:
+            response = self.client.secrets.kv.v2.read_secret_version(
+                path=path,
+                mount_point=self.mount_point,
+            )
+            existing_block = response.get("data", {})
+            base_secret = dict(existing_block.get("data", {}))
+            metadata = existing_block.get("metadata", {})
+            version = metadata.get("version")
+            if not isinstance(version, int) or version < 1:
+                raise ValueError(f"Vault metadata missing valid version at path: {path}")
+            cas = version
+        except InvalidPath:
+            cas = 0
+            base_secret = {}
+        except VaultError as exc:
+            raise ValueError(f"Vault pre-write read failed for path: {path}") from exc
+
+        merged = dict(base_secret)
+        merged[self.password_key] = new_password
         try:
             self.client.secrets.kv.v2.create_or_update_secret(
                 path=path,
                 mount_point=self.mount_point,
-                secret={self.password_key: new_password},
+                secret=merged,
+                cas=cas,
             )
         except VaultError as exc:
             raise ValueError(f"Vault write failed for path: {path}") from exc
@@ -372,7 +404,7 @@ def process_one_server(
     timeout_seconds: int,
     password_length: int,
     password_specials: str,
-    vault_client: VaultKv2Client,
+    vault_client: Optional[VaultKv2Client],
     racadm_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> RotationResult:
     logging.info("Processing host=%s site=%s env=%s", record.idrac_host, record.site, record.environment)
@@ -382,6 +414,14 @@ def process_one_server(
             record,
             status="DRY_RUN_SKIPPED",
             remediation_note="Dry-run mode: no iDRAC or Vault changes performed.",
+        )
+
+    if vault_client is None:
+        return make_result(
+            record,
+            status="FAILED",
+            sanitized_error="Vault client unavailable.",
+            remediation_note="Initialize Vault client or use --dry-run.",
         )
 
     try:
@@ -521,6 +561,11 @@ def write_reports(results: Sequence[RotationResult], report_stem: str, summary: 
 
 
 def orchestrate(args: argparse.Namespace) -> int:
+    if args.concurrency < 1:
+        raise ValueError("--concurrency must be >= 1")
+    if args.timeout < 1:
+        raise ValueError("--timeout must be >= 1")
+
     records = parse_csv(Path(args.input_file))
 
     resume_success: Set[str] = set()
@@ -554,19 +599,15 @@ def orchestrate(args: argparse.Namespace) -> int:
         write_reports([], args.report_file, summary)
         return 0
 
-    vault_client = VaultKv2Client(mount_point=args.vault_mount, password_key=args.vault_password_key)
+    vault_client: Optional[VaultKv2Client] = None
+    if not args.dry_run:
+        vault_client = VaultKv2Client(mount_point=args.vault_mount, password_key=args.vault_password_key)
 
     results: List[RotationResult] = []
     lock = Lock()
-    stop_scheduling = False
-
-    with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
-        future_to_record = {}
+    if args.fail_fast:
         for record in selected:
-            if stop_scheduling:
-                break
-            future = executor.submit(
-                process_one_server,
+            result = process_one_server(
                 record=record,
                 dry_run=args.dry_run,
                 timeout_seconds=args.timeout,
@@ -574,30 +615,47 @@ def orchestrate(args: argparse.Namespace) -> int:
                 password_specials=args.password_specials,
                 vault_client=vault_client,
             )
-            future_to_record[future] = record
-
-        for future in as_completed(future_to_record):
-            record = future_to_record[future]
-            try:
-                result = future.result()
-            except Exception as exc:
-                result = make_result(
-                    record,
-                    status="FAILED",
-                    sanitized_error=sanitize_text(f"Unhandled worker exception: {exc}"),
-                    remediation_note="Inspect worker logs and retry host.",
-                )
-
-            with lock:
-                results.append(result)
-
+            results.append(result)
             if result.status in {"FAILED", "CRITICAL_PARTIAL_FAILURE"}:
                 level = logging.CRITICAL if result.status == "CRITICAL_PARTIAL_FAILURE" else logging.ERROR
-                logging.log(level, "Host=%s status=%s", result.idrac_host, result.status)
-                if args.fail_fast:
-                    stop_scheduling = True
-            else:
-                logging.info("Host=%s status=%s", result.idrac_host, result.status)
+                logging.log(level, "Host=%s status=%s (fail-fast stopping)", result.idrac_host, result.status)
+                break
+            logging.info("Host=%s status=%s", result.idrac_host, result.status)
+    else:
+        with ThreadPoolExecutor(max_workers=args.concurrency) as executor:
+            future_to_record = {}
+            for record in selected:
+                future = executor.submit(
+                    process_one_server,
+                    record=record,
+                    dry_run=args.dry_run,
+                    timeout_seconds=args.timeout,
+                    password_length=args.password_length,
+                    password_specials=args.password_specials,
+                    vault_client=vault_client,
+                )
+                future_to_record[future] = record
+
+            for future in as_completed(future_to_record):
+                record = future_to_record[future]
+                try:
+                    result = future.result()
+                except Exception as exc:
+                    result = make_result(
+                        record,
+                        status="FAILED",
+                        sanitized_error=sanitize_text(f"Unhandled worker exception: {exc}"),
+                        remediation_note="Inspect worker logs and retry host.",
+                    )
+
+                with lock:
+                    results.append(result)
+
+                if result.status in {"FAILED", "CRITICAL_PARTIAL_FAILURE"}:
+                    level = logging.CRITICAL if result.status == "CRITICAL_PARTIAL_FAILURE" else logging.ERROR
+                    logging.log(level, "Host=%s status=%s", result.idrac_host, result.status)
+                else:
+                    logging.info("Host=%s status=%s", result.idrac_host, result.status)
 
     results.sort(key=lambda r: r.idrac_host)
     summary = summarize(results, initial_skipped=initially_skipped)
