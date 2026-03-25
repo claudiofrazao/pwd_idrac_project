@@ -13,7 +13,9 @@ The tool is intentionally designed so Vault is updated **only after** a successf
 - Batch password rotation from CSV input.
 - Unique, random password generation per server.
 - HashiCorp Vault KV v2 integration for read/write secret workflows.
+- Pre-flight validation of Vault secret version/state before write.
 - Dell `racadm` integration for iDRAC password updates.
+- Optional Rundeck integration for enterprise job-runner execution.
 - `--dry-run` mode for safe validation without iDRAC or Vault writes.
 - Simulation-friendly architecture via mocked Vault and racadm runners in tests.
 - Concurrency control with configurable thread pool (`--concurrency`).
@@ -138,10 +140,34 @@ export VAULT_NAMESPACE="infrastructure/operations"
 
 - `--vault-mount` (default: `secret`) for KV v2 mount name.
 - `--vault-password-key` (default: `password`) for secret field name.
+- `--job-runner` (`local` or `rundeck`) to select local racadm vs enterprise job orchestration.
 - `--password-length` and `--password-specials` for password policy tuning.
 - `--timeout` for per-host `racadm` timeout.
 - `--bootstrap-shared-current-password` to enable bootstrap exception mode.
 - `--shared-current-password-env` to select env var name for bootstrap shared current password (default: `IDRAC_SHARED_CURRENT_PASSWORD`).
+
+### Rundeck Job Runner (Optional)
+
+When `--job-runner rundeck` is enabled, the tool triggers a Rundeck job per host and waits for completion instead of executing local `racadm`.
+
+Required:
+
+- `--rundeck-url`
+- `--rundeck-job-id`
+- `--rundeck-api-token-env` (defaults to `RUNDECK_API_TOKEN`)
+
+Expected Rundeck job option names:
+
+- `idrac_host`
+- `idrac_username`
+- `target_account_id`
+- `target_account_username`
+- `current_password`
+- `new_password`
+
+Optional:
+
+- `--rundeck-insecure-skip-tls-verify` for non-production TLS exceptions.
 
 ## Input CSV Format
 

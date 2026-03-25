@@ -33,9 +33,10 @@ import idrac_password_rotator as rot
 
 
 class StubVault:
-    def __init__(self, read_pw="OldPass!234", fail_write=False):
+    def __init__(self, read_pw="OldPass!234", fail_write=False, read_version=7):
         self.read_pw = read_pw
         self.fail_write = fail_write
+        self.read_version = read_version
         self.writes = []
         self.read_calls = 0
 
@@ -43,10 +44,14 @@ class StubVault:
         self.read_calls += 1
         return self.read_pw
 
-    def write_password(self, path: str, new_password: str) -> None:
+    def read_password_with_version(self, path: str):
+        self.read_calls += 1
+        return self.read_pw, self.read_version
+
+    def write_password(self, path: str, new_password: str, *, expected_current_version=None) -> None:
         if self.fail_write:
             raise ValueError("vault write failed")
-        self.writes.append((path, new_password))
+        self.writes.append((path, new_password, expected_current_version))
 
 
 def mk_record() -> rot.ServerRecord:
@@ -102,6 +107,7 @@ def test_success_flow() -> None:
     assert result.vault_updated
     assert len(vault.writes) == 1
     assert vault.read_calls == 1
+    assert vault.writes[0][2] == 7
 
 
 def test_bootstrap_success_flow_uses_shared_password_and_writes_vault() -> None:
@@ -126,6 +132,7 @@ def test_bootstrap_success_flow_uses_shared_password_and_writes_vault() -> None:
     assert result.vault_updated
     assert len(vault.writes) == 1
     assert vault.read_calls == 0
+    assert vault.writes[0][2] is None
 
 
 def test_racadm_failure_flow() -> None:
@@ -309,3 +316,64 @@ def test_orchestrate_fail_fast_stops_after_first_failure(monkeypatch, tmp_path: 
     rc = rot.orchestrate(args)
     assert rc == 1
     assert calls["n"] == 1
+
+
+def test_process_uses_custom_password_change_function() -> None:
+    called = {"n": 0}
+
+    def fake_change(record, current_password, new_password, timeout_seconds):
+        called["n"] += 1
+        assert record.idrac_host == "10.0.0.1"
+        assert current_password == "OldPass!234"
+        assert timeout_seconds == 5
+        return True, "ok"
+
+    record = mk_record()
+    vault = StubVault()
+    result = rot.process_one_server(
+        record=record,
+        dry_run=False,
+        timeout_seconds=5,
+        password_length=16,
+        password_specials="!@#",
+        vault_client=vault,
+        password_change_func=fake_change,
+    )
+    assert called["n"] == 1
+    assert result.status == "SUCCESS"
+
+
+def test_orchestrate_rundeck_requires_token(monkeypatch, tmp_path: Path) -> None:
+    csv_path = tmp_path / "in.csv"
+    csv_path.write_text(
+        "idrac_host,idrac_username,current_password_vault_path,target_account_username,target_account_id,new_password_vault_path,site,environment\n"
+        "h1,root,a,root,2,b,dc1,prod\n",
+        encoding="utf-8",
+    )
+    args = SimpleNamespace(
+        input_file=str(csv_path),
+        dry_run=True,
+        limit=None,
+        concurrency=1,
+        timeout=30,
+        verbose=False,
+        report_file=str(tmp_path / "report"),
+        resume_from_report=None,
+        password_length=16,
+        vault_mount="secret",
+        fail_fast=False,
+        site_filter=None,
+        environment_filter=None,
+        password_specials="!@#",
+        vault_password_key="password",
+        bootstrap_shared_current_password=False,
+        shared_current_password_env="IDRAC_SHARED_CURRENT_PASSWORD",
+        job_runner="rundeck",
+        rundeck_url="https://rundeck.example",
+        rundeck_job_id="abcd-1234",
+        rundeck_api_token_env="RUNDECK_API_TOKEN",
+        rundeck_insecure_skip_tls_verify=False,
+    )
+    monkeypatch.delenv("RUNDECK_API_TOKEN", raising=False)
+    with pytest.raises(ValueError, match="RUNDECK_API_TOKEN"):
+        rot.orchestrate(args)

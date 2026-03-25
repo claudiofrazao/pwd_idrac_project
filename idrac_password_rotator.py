@@ -26,6 +26,10 @@ import secrets
 import string
 import subprocess
 import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
@@ -143,6 +147,24 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--environment-filter", default=None, help="Only process matching environment value")
     parser.add_argument("--password-specials", default=DEFAULT_PASSWORD_SPECIALS, help="Allowed special chars")
     parser.add_argument("--vault-password-key", default="password", help="Field name in Vault secret data")
+    parser.add_argument(
+        "--job-runner",
+        choices=("local", "rundeck"),
+        default="local",
+        help="Execution backend for password-change jobs (default: local racadm).",
+    )
+    parser.add_argument("--rundeck-url", default=None, help="Rundeck base URL (required when --job-runner=rundeck).")
+    parser.add_argument("--rundeck-job-id", default=None, help="Rundeck job ID (required when --job-runner=rundeck).")
+    parser.add_argument(
+        "--rundeck-api-token-env",
+        default="RUNDECK_API_TOKEN",
+        help="Environment variable name containing Rundeck API token.",
+    )
+    parser.add_argument(
+        "--rundeck-insecure-skip-tls-verify",
+        action="store_true",
+        help="Disable TLS certificate verification for Rundeck API requests.",
+    )
     parser.add_argument(
         "--bootstrap-shared-current-password",
         action="store_true",
@@ -270,7 +292,63 @@ class VaultKv2Client:
             raise ValueError(f"Vault metadata missing valid version at path: {path}")
         return value, version
 
-    def write_password(self, path: str, new_password: str) -> None:
+    def _preflight_validate_secret_state(
+        self,
+        path: str,
+        *,
+        expected_current_version: Optional[int],
+    ) -> None:
+        """Validate current secret state before write to avoid unsafe updates."""
+        try:
+            metadata_response = self.client.secrets.kv.v2.read_secret_metadata(
+                path=path,
+                mount_point=self.mount_point,
+            )
+        except InvalidPath:
+            if expected_current_version is not None:
+                raise ValueError(
+                    f"Vault pre-flight failed for path '{path}': secret no longer exists but a specific version was expected."
+                )
+            return
+        except VaultError as exc:
+            raise ValueError(f"Vault pre-flight metadata read failed for path: {path}") from exc
+
+        metadata = metadata_response.get("data", {})
+        current_version = metadata.get("current_version")
+        if not isinstance(current_version, int) or current_version < 0:
+            raise ValueError(f"Vault pre-flight metadata missing valid current_version at path: {path}")
+
+        if expected_current_version is not None and current_version != expected_current_version:
+            raise ValueError(
+                f"Vault pre-flight version drift for path '{path}': expected version "
+                f"{expected_current_version}, observed {current_version}."
+            )
+
+        if current_version < 1:
+            return
+
+        versions = metadata.get("versions", {})
+        version_state = versions.get(str(current_version), {})
+        if not isinstance(version_state, dict):
+            return
+        deletion_time = str(version_state.get("deletion_time", "") or "").strip()
+        destroyed = bool(version_state.get("destroyed", False))
+        if deletion_time or destroyed:
+            raise ValueError(
+                f"Vault pre-flight state for path '{path}' is not writable (deletion_time='{deletion_time}', destroyed={destroyed})."
+            )
+
+    def write_password(
+        self,
+        path: str,
+        new_password: str,
+        *,
+        expected_current_version: Optional[int] = None,
+    ) -> None:
+        self._preflight_validate_secret_state(
+            path,
+            expected_current_version=expected_current_version,
+        )
         cas: Optional[int]
         base_secret: Dict[str, object]
         try:
@@ -302,6 +380,98 @@ class VaultKv2Client:
             )
         except VaultError as exc:
             raise ValueError(f"Vault write failed for path: {path}") from exc
+
+
+class RundeckJobRunner:
+    """Run enterprise password-change jobs via Rundeck."""
+
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        job_id: str,
+        api_token: str,
+        verify_tls: bool = True,
+    ) -> None:
+        if not base_url:
+            raise ValueError("Rundeck base URL is required")
+        if not job_id:
+            raise ValueError("Rundeck job ID is required")
+        if not api_token:
+            raise ValueError("Rundeck API token is required")
+        self.base_url = base_url.rstrip("/")
+        self.job_id = job_id
+        self.api_token = api_token
+        self.verify_tls = verify_tls
+
+    def _request(
+        self,
+        *,
+        method: str,
+        url: str,
+        payload: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, object]:
+        body = None
+        headers = {
+            "Accept": "application/json",
+            "X-Rundeck-Auth-Token": self.api_token,
+        }
+        if payload is not None:
+            body = json.dumps(payload).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        request = urllib.request.Request(url=url, method=method, data=body, headers=headers)
+        context = None
+        if not self.verify_tls:
+            import ssl
+
+            context = ssl._create_unverified_context()
+        try:
+            with urllib.request.urlopen(request, context=context, timeout=30) as response:
+                raw = response.read().decode("utf-8")
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            raise ValueError(f"Rundeck API HTTP {exc.code}: {sanitize_text(detail)}") from exc
+        except urllib.error.URLError as exc:
+            raise ValueError(f"Rundeck API request failed: {sanitize_text(str(exc))}") from exc
+
+    def run_password_change(
+        self,
+        *,
+        record: ServerRecord,
+        current_password: str,
+        new_password: str,
+        timeout_seconds: int,
+    ) -> Tuple[bool, str]:
+        run_url = f"{self.base_url}/api/41/job/{urllib.parse.quote(self.job_id, safe='')}/run"
+        payload = {
+            "options": {
+                "idrac_host": record.idrac_host,
+                "idrac_username": record.idrac_username,
+                "target_account_id": record.target_account_id,
+                "target_account_username": record.target_account_username,
+                "current_password": current_password,
+                "new_password": new_password,
+            }
+        }
+        run_response = self._request(method="POST", url=run_url, payload=payload)
+        execution = run_response.get("execution", {})
+        execution_id = execution.get("id")
+        if execution_id is None:
+            return False, "Rundeck API did not return an execution id"
+
+        deadline = time.monotonic() + timeout_seconds
+        state_url = f"{self.base_url}/api/41/execution/{execution_id}/state"
+        while time.monotonic() < deadline:
+            state_payload = self._request(method="GET", url=state_url)
+            exec_state = str(state_payload.get("executionState", "")).upper()
+            if exec_state in {"SUCCEEDED"}:
+                return True, f"Rundeck execution {execution_id} succeeded"
+            if exec_state in {"FAILED", "ABORTED", "TIMEDOUT"}:
+                return False, f"Rundeck execution {execution_id} ended with state={exec_state}"
+            time.sleep(2)
+
+        return False, f"Rundeck execution {execution_id} timed out after {timeout_seconds}s"
 
 
 def generate_password(
@@ -424,6 +594,9 @@ def process_one_server(
     password_specials: str,
     vault_client: Optional[VaultKv2Client],
     shared_current_password: Optional[str] = None,
+    password_change_func: Optional[
+        Callable[[ServerRecord, str, str, int], Tuple[bool, str]]
+    ] = None,
     racadm_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> RotationResult:
     logging.info("Processing host=%s site=%s env=%s", record.idrac_host, record.site, record.environment)
@@ -444,9 +617,12 @@ def process_one_server(
         )
 
     current_password = shared_current_password
+    current_password_version: Optional[int] = None
     if current_password is None:
         try:
-            current_password = vault_client.read_password(record.current_password_vault_path)
+            current_password, current_password_version = vault_client.read_password_with_version(
+                record.current_password_vault_path
+            )
         except Exception as exc:
             return make_result(
                 record,
@@ -465,13 +641,21 @@ def process_one_server(
             remediation_note="Adjust password policy settings and retry.",
         )
 
-    racadm_ok, racadm_msg = run_racadm_password_change(
-        record=record,
-        current_password=current_password,
-        new_password=new_password,
-        timeout_seconds=timeout_seconds,
-        runner=racadm_runner,
-    )
+    if password_change_func is None:
+        racadm_ok, racadm_msg = run_racadm_password_change(
+            record=record,
+            current_password=current_password,
+            new_password=new_password,
+            timeout_seconds=timeout_seconds,
+            runner=racadm_runner,
+        )
+    else:
+        racadm_ok, racadm_msg = password_change_func(
+            record,
+            current_password,
+            new_password,
+            timeout_seconds,
+        )
     if not racadm_ok:
         return make_result(
             record,
@@ -483,7 +667,16 @@ def process_one_server(
         )
 
     try:
-        vault_client.write_password(record.new_password_vault_path, new_password)
+        expected_version = (
+            current_password_version
+            if record.new_password_vault_path == record.current_password_vault_path
+            else None
+        )
+        vault_client.write_password(
+            record.new_password_vault_path,
+            new_password,
+            expected_current_version=expected_version,
+        )
     except Exception as exc:
         return make_result(
             record,
@@ -640,6 +833,31 @@ def orchestrate(args: argparse.Namespace) -> int:
     if not args.dry_run:
         vault_client = VaultKv2Client(mount_point=args.vault_mount, password_key=args.vault_password_key)
 
+    password_change_func: Optional[Callable[[ServerRecord, str, str, int], Tuple[bool, str]]] = None
+    if getattr(args, "job_runner", "local") == "rundeck":
+        token_env = getattr(args, "rundeck_api_token_env", "RUNDECK_API_TOKEN")
+        token_value = os.getenv(token_env)
+        if not token_value:
+            raise ValueError(
+                f"--job-runner=rundeck requires environment variable '{token_env}' with API token."
+            )
+        rundeck_runner = RundeckJobRunner(
+            base_url=getattr(args, "rundeck_url", None) or "",
+            job_id=getattr(args, "rundeck_job_id", None) or "",
+            api_token=token_value,
+            verify_tls=not bool(getattr(args, "rundeck_insecure_skip_tls_verify", False)),
+        )
+
+        def _rundeck_change(record: ServerRecord, current_password: str, new_password: str, timeout_seconds: int) -> Tuple[bool, str]:
+            return rundeck_runner.run_password_change(
+                record=record,
+                current_password=current_password,
+                new_password=new_password,
+                timeout_seconds=timeout_seconds,
+            )
+
+        password_change_func = _rundeck_change
+
     results: List[RotationResult] = []
     lock = Lock()
     if args.fail_fast:
@@ -652,6 +870,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                 password_specials=args.password_specials,
                 vault_client=vault_client,
                 shared_current_password=shared_current_password,
+                password_change_func=password_change_func,
             )
             results.append(result)
             if result.status in {"FAILED", "CRITICAL_PARTIAL_FAILURE"}:
@@ -669,10 +888,11 @@ def orchestrate(args: argparse.Namespace) -> int:
                     dry_run=args.dry_run,
                     timeout_seconds=args.timeout,
                     password_length=args.password_length,
-                    password_specials=args.password_specials,
-                    vault_client=vault_client,
-                    shared_current_password=shared_current_password,
-                )
+                        password_specials=args.password_specials,
+                        vault_client=vault_client,
+                        shared_current_password=shared_current_password,
+                        password_change_func=password_change_func,
+                    )
                 future_to_record[future] = record
 
             for future in as_completed(future_to_record):
