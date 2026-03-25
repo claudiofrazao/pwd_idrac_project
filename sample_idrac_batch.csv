@@ -1,0 +1,4 @@
+idrac_host,idrac_username,current_password_vault_path,target_account_username,target_account_id,new_password_vault_path,site,environment
+10.0.10.21,root,idrac/prod/dc1/r740-01/current,root,2,idrac/prod/dc1/r740-01/current,dc1,prod
+10.0.10.22,root,idrac/prod/dc1/r740-02/current,root,2,idrac/prod/dc1/r740-02/current,dc1,prod
+10.2.20.31,root,idrac/stage/dc2/r750-01/current,root,2,idrac/stage/dc2/r750-01/current,dc2,stage
