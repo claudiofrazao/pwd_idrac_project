@@ -1,263 +1,189 @@
-# Dell iDRAC Batch Password Rotator
+# iDRAC Password Rotator (Vault + racadm/Rundeck)
 
-## Overview
+## What this tool does
 
-This project provides a production-oriented Python CLI to rotate Dell iDRAC account passwords in batch across many servers.
+`idrac_password_rotator.py` is a batch CLI that rotates iDRAC account passwords from a CSV inventory.
 
-It exists to solve a common operational risk in infrastructure teams: credential drift between hardware management interfaces (iDRAC) and centralized secret stores. In this workflow, HashiCorp Vault is the source of truth for credential retrieval and persistence, while `racadm` (or an enterprise job runner) is used to apply password changes on each iDRAC endpoint.
+For each selected host, the implemented workflow is:
 
-The tool is intentionally designed so Vault is updated **only after** a successful password change on the target iDRAC. Before writing, it also performs **Vault pre-flight validation** of secret metadata/state (and version expectations where applicable) to reduce unsafe writes. The CLI can run directly on an automation host or through **Rundeck** as an enterprise execution/orchestration layer.
+1. Obtain the current password (from Vault in normal mode, or from a shared env var in bootstrap mode).
+2. Generate a new random password in memory.
+3. Attempt the password change on iDRAC (local `racadm` or Rundeck job runner).
+4. Only if step 3 succeeds, write the new password to Vault KV v2.
+5. Emit per-host result rows and run summary to JSON/CSV reports.
 
-## Key Features
+The code explicitly models the split-brain condition where iDRAC change succeeds but Vault write fails as `CRITICAL_PARTIAL_FAILURE`.
 
-- Batch password rotation from CSV input.
-- Unique, random password generation per server.
-- HashiCorp Vault KV v2 integration for read/write secret workflows.
-- Pre-flight Vault secret validation before update (metadata/state checks before write).
-- Safer secret-state/version checks before write when rotating in-place (same read/write path).
-- Dell `racadm` integration for direct iDRAC password updates.
-- Rundeck integration for controlled enterprise execution via API-driven job runs.
-- Compatibility with centralized scheduling and operational runbooks (local CLI or Rundeck job orchestration).
-- `--dry-run` mode for safe validation without iDRAC or Vault writes.
-- Simulation-friendly architecture via mocked Vault and racadm runners in tests.
-- Concurrency control with configurable thread pool (`--concurrency`).
-- Structured reporting to both CSV and JSON.
-- Resume support (`--resume-from-report`) to skip prior successful hosts.
-- Explicit partial-failure detection (`CRITICAL_PARTIAL_FAILURE`) when iDRAC changes but Vault update fails.
-- Sanitized, audit-friendly logging that avoids secret disclosure.
-- Explicit **bootstrap exception mode** for first-run rotations when current passwords are not yet in Vault.
+---
 
-## Architecture Summary
+## Current scope and non-goals
 
-Main components:
+### In scope (implemented)
 
-- **CLI/config (`argparse`)**: Parses runtime flags (input file, filters, concurrency, timeout, dry-run, reporting, resume behavior).
-- **CSV loader/validator**: Enforces required columns, non-empty fields, and duplicate-host prevention.
-- **Vault client (`VaultKv2Client`)**: Reads and writes password fields from/to KV v2 paths with metadata/state pre-flight checks and CAS-safe updates.
-- **Password policy engine (`generate_password`)**: Produces strong random passwords with configurable length and special-character set.
-- **Execution backend**:
-  - **Local mode**: `run_racadm_password_change` executes `racadm` directly.
-  - **Rundeck mode**: `RundeckJobRunner` calls Rundeck API to launch and monitor a password-change job per host.
-- **Orchestrator (`orchestrate`)**: Applies filters, resume behavior, concurrency/fail-fast execution, summary generation, and exit code logic.
-- **Reporting (`write_reports`)**: Emits per-host result rows and aggregate summary in JSON and CSV.
-- **Simulation backends**: Test-time stubs/mocks for Vault and execution runners to simulate success, failure, and partial failure safely.
+- CSV-driven batch execution with schema validation.
+- Host filtering (`site`, `environment`), `--limit`, and resume from prior report successes.
+- Per-host status reporting and aggregate summary.
+- Concurrency via thread pool, plus optional fail-fast sequential mode.
+- Vault KV v2 read/write with pre-flight metadata checks and CAS write behavior.
+- Bootstrap exception mode using one shared current password env var.
+- Optional Rundeck job runner backend for the password-change step.
 
-Operational flow summary:
+### Non-goals / not implemented
 
-- Vault remains the system of record for credential state.
-- The runner (local `racadm` or Rundeck job) performs the iDRAC password change.
-- Vault pre-flight validation is executed immediately before write in the post-change stage.
-- Rundeck, when used, is an orchestration/execution layer around this CLI workflow; it is **not** the credential source of truth.
+- No device discovery; targets must come from CSV.
+- No encrypted local state database/checkpoint file (resume is report-driven only).
+- No automatic rollback if Vault update fails after iDRAC change.
+- No built-in scheduler; execution cadence is external (cron/Rundeck/etc.).
+- No guarantee that `racadm` command syntax works across all firmware revisions (must be validated in your environment).
 
-## Safe Workflow
+---
 
-The implemented safe sequence is:
+## How it works
 
-1. **Read current credential state from Vault** (`current_password_vault_path`) in normal mode, including the current secret version.
-2. **Generate a candidate new password in memory** (never persisted in plaintext logs).
-3. **Apply password change** using the configured execution backend:
-   - local `racadm`, or
-   - Rundeck job execution (which performs the change externally).
-4. **If change succeeds, run Vault pre-flight validation before write** against `new_password_vault_path`:
-   - checks metadata can be read,
-   - checks latest version state is writable (not deleted/destroyed),
-   - when writing back to the same path used for the read, checks observed version still matches expected version.
-5. **Write new secret to Vault only after successful change + pre-flight pass**.
-6. **Handle partial failures explicitly**:
-   - if password change succeeded but Vault validation/write failed, host is marked `CRITICAL_PARTIAL_FAILURE` and requires urgent operator remediation.
+### Per-host lifecycle (`process_one_server`)
 
-This sequence is the core control that reduces drift while still surfacing high-risk split-brain conditions.
+- If `--dry-run`, host is marked `DRY_RUN_SKIPPED`; no iDRAC/Vault change is attempted.
+- Otherwise:
+  - Read current password (+ version) from Vault unless bootstrap shared password is active.
+  - Generate a new password (`generate_password`) with required character classes and minimum length logic.
+  - Execute password change via:
+    - `run_racadm_password_change` (local), or
+    - Rundeck API execution wrapper (`RundeckJobRunner`) when `--job-runner rundeck`.
+  - If change failed: host status `FAILED`, Vault not updated.
+  - If change succeeded: write to Vault with pre-flight validation and CAS semantics.
+  - If Vault write then fails: host status `CRITICAL_PARTIAL_FAILURE` with remediation note.
+  - If both succeed: host status `SUCCESS`.
 
-## Vault Pre-flight Validation
+### Exit codes
 
-### What it means in this project
+The process returns:
 
-Before writing a new password to Vault, the tool performs a pre-flight metadata/state check on the target KV v2 path.
+- `0`: no host failures/partial failures.
+- `1`: one or more `FAILED` hosts (or fatal/validation error).
+- `2`: one or more `CRITICAL_PARTIAL_FAILURE` hosts.
 
-### Why it exists
+---
 
-This check reduces the chance of writing into an unexpected secret state (for example, drifted version state or non-writable latest version) and makes write safety explicit.
+## Execution modes
 
-### What is checked before write
+## 1) Normal mode (default)
 
-Current implementation validates:
+- Current password is read per host from `current_password_vault_path`.
+- New password is written to `new_password_vault_path` after successful change.
+- If read path equals write path, Vault pre-flight enforces expected version matching.
 
-- Secret metadata readability for the target path.
-- `current_version` sanity in metadata.
-- Latest version state is writable (not soft-deleted and not destroyed).
-- Optional version expectation on in-place rotation:
-  - If `new_password_vault_path == current_password_vault_path`, the tool compares expected version (captured at read time) with observed `current_version` at pre-flight time.
+## 2) Bootstrap mode
 
-### Secret existence / overwrite safety behavior
+Enabled by `--bootstrap-shared-current-password`.
 
-- If target path does not exist:
-  - allowed for writes where no specific prior version is expected (new secret creation path),
-  - rejected when a specific existing version is expected.
-- Write is still performed with KV v2 CAS semantics after pre-flight (existing data merged; password field updated).
+- Current password is **not** read from Vault per host.
+- Current password comes from env var `IDRAC_SHARED_CURRENT_PASSWORD` (or custom via `--shared-current-password-env`).
+- CSV can omit `current_password_vault_path` header/value in this mode.
+- If env var is missing, orchestration fails before processing.
 
-### How this reduces unsafe writes
+Use case appears to be first-time rollout where fleet still shares one known current password.
 
-- Detects version drift before write on in-place rotations.
-- Prevents writes to paths where latest version state is marked deleted/destroyed.
-- Fails early with actionable error context instead of silently overwriting unexpected state.
+## 3) Simulation / dry-run mode
 
-### Assumptions and limitations
+Enabled by `--dry-run`.
 
-- Version drift comparison is currently strict only for in-place updates (same read/write path).
-- If read/write paths differ, version expectation is not enforced between those paths.
-- Validation depends on Vault KV v2 metadata behavior and policy permissions.
+- CSV parsing/filtering/resume selection still runs.
+- Vault client is not initialized.
+- iDRAC change and Vault write are skipped.
+- Reports are still produced with `DRY_RUN_SKIPPED` rows and skipped counts.
 
-## Bootstrap Exception Mode (Initial Rollout Only)
+---
 
-Use bootstrap mode only for the first rollout when:
-
-- all target iDRACs still share the same current password, and
-- current passwords are not yet stored in Vault.
-
-When bootstrap mode is enabled:
-
-1. The tool does **not** read `current_password_vault_path` per server from Vault.
-2. It reads one shared current password from an environment variable at runtime.
-3. It still generates a unique new password per server.
-4. It still writes each new password to that server's `new_password_vault_path` after successful password-change execution.
-5. If password change fails, no Vault write occurs.
-6. If Vault write fails after successful password change, status is `CRITICAL_PARTIAL_FAILURE` with remediation guidance.
-
-> Security note: do not pass shared passwords as direct CLI values. Prefer env vars so secrets are not exposed in shell history/process lists.
-
-After the initial bootstrap rotation completes, migrate immediately back to the standard per-server Vault-read mode.
-
-## Rundeck Integration
-
-Rundeck support allows this CLI to run inside an enterprise job-runner model while preserving the tool's Vault-centric state flow and reporting semantics.
-
-### Why Rundeck is useful here
-
-- Centralized scheduling for maintenance windows.
-- Controlled, permissioned operator execution.
-- Scoped execution by site/environment via job options.
-- Standardized audit trail of who ran what and when.
-- Alignment with existing operations runbooks.
-
-### Operational model
-
-- This CLI remains the workflow controller and report producer.
-- With `--job-runner rundeck`, per-host password change is delegated to a Rundeck job via API.
-- Rundeck job executes the change logic in your approved execution environment.
-- CLI polls Rundeck execution state (`SUCCEEDED`/`FAILED`/`ABORTED`/`TIMEDOUT`) and continues normal post-change flow.
-- Vault is still read/written by this CLI; Rundeck is not the source of truth.
-
-### Typical enterprise use cases
-
-- Scheduled rotation windows (nightly/weekly/monthly policy windows).
-- Controlled production job execution with operator approvals.
-- Scoped runs by site/environment (`--site-filter`, `--environment-filter`).
-- Operator-triggered incident or emergency rotations.
-- Audit-friendly execution history with per-run reports retained as artifacts.
-
-### Practical workflow considerations in Rundeck
-
-- Store Vault/Rundeck tokens in secure key storage, then expose to runtime env vars only for the job context.
-- Pass input CSV and report output locations explicitly in job step arguments.
-- Ensure job working directory/path mapping is deterministic.
-- Capture generated JSON/CSV reports as Rundeck artifacts for post-run review.
-- Do not echo secret-bearing env vars/options to logs.
-
-## Project Structure
+## Architecture and code structure
 
 ```text
 .
-├── idrac_password_rotator.py        # Main CLI, orchestration, Vault/racadm/Rundeck integration, reporting
-├── requirements.txt                 # Python dependencies
-├── sample_idrac_batch.csv           # Example input dataset
+├── idrac_password_rotator.py
 ├── tests/
-│   └── test_idrac_password_rotator.py  # Unit tests (CSV validation, flow outcomes, fail-fast)
-└── README.md                        # This documentation
+│   └── test_idrac_password_rotator.py
+├── sample_idrac_batch.csv
+├── requirements.txt
+└── README.md
 ```
 
-## Requirements
+### Main components
 
-- **Python**: 3.9+ recommended.
-- **Execution backend**:
-  - Local mode: `racadm` binary installed and available in `PATH`.
-  - Rundeck mode: reachable Rundeck API endpoint and executable job definition.
-- **Vault access**:
-  - Network reachability to Vault.
-  - Valid token with read/write access to relevant KV v2 paths.
-- **Operating system**: Linux automation host is assumed (or equivalent environment where Python and backend tools are available).
+- `parse_args`: CLI surface.
+- `parse_csv`: schema/content/duplicate-host validation.
+- `VaultKv2Client`: Vault auth + KV v2 read/write + pre-flight metadata validation.
+- `run_racadm_password_change`: local `racadm` command execution.
+- `RundeckJobRunner`: Rundeck API integration for per-host password-change job execution.
+- `process_one_server`: per-host state machine and status mapping.
+- `orchestrate`: selection, concurrency/fail-fast scheduling, reporting, exit code.
+- `write_reports`: JSON and CSV artifact generation.
 
-## Installation
+---
 
-```bash
-git clone <REPO_URL>
-cd pwd_idrac_project
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-```
+## Requirements and external dependencies
 
-Verify `racadm` availability before running production rotations in local mode:
+- Python 3.x (repository does not pin interpreter version explicitly).
+- Python package: `hvac` (`requirements.txt`).
+- Vault KV v2 endpoint reachable from runtime.
+- Vault token with required read/write/metadata permissions.
+- Local mode only: `racadm` binary available in `PATH` and compatible with target iDRAC.
+- Rundeck mode only:
+  - Rundeck URL and job ID.
+  - API token in environment variable (default `RUNDECK_API_TOKEN`).
 
-```bash
-racadm --version
-which racadm
-```
-
-If `racadm` is not found, install Dell OpenManage / RACADM tooling per your platform standard.
+---
 
 ## Configuration
 
-Set Vault connectivity/authentication through environment variables:
+### Environment variables
+
+Vault:
+
+- `VAULT_ADDR` (required unless dry-run): Vault base URL.
+- `VAULT_TOKEN` (required unless dry-run): Vault token.
+- `VAULT_NAMESPACE` (optional): passed to `hvac.Client`.
+
+Bootstrap mode:
+
+- `IDRAC_SHARED_CURRENT_PASSWORD` by default, or custom env name via `--shared-current-password-env`.
+
+Rundeck mode:
+
+- `RUNDECK_API_TOKEN` by default, or custom env name via `--rundeck-api-token-env`.
+
+### CLI options (implemented)
 
 ```bash
-export VAULT_ADDR="https://vault.example.internal:8200"
-export VAULT_TOKEN="<short-lived-rotation-token>"
-# Optional (required only in namespaced Vault deployments)
-export VAULT_NAMESPACE="infrastructure/operations"
+python3 idrac_password_rotator.py --input-file <csv> [options]
 ```
 
-### Variable Reference
+Important options:
 
-- `VAULT_ADDR` (required): Vault API endpoint.
-- `VAULT_TOKEN` (required): Token used by the tool for KV v2 read/write.
-- `VAULT_NAMESPACE` (optional): Vault namespace, if your deployment uses enterprise namespaces.
+- `--dry-run`
+- `--limit <N>`
+- `--concurrency <N>` (default `4`)
+- `--timeout <seconds>` (default `60`)
+- `--report-file <stem>` (default `rotation_report`)
+- `--resume-from-report <path.{json|csv}>`
+- `--password-length <N>` (default `24`, must satisfy policy checks)
+- `--password-specials <chars>`
+- `--vault-mount <mount>` (default `secret`)
+- `--vault-password-key <key>` (default `password`)
+- `--site-filter <site>`
+- `--environment-filter <env>`
+- `--fail-fast`
+- `--job-runner local|rundeck` (default `local`)
+- `--rundeck-url <url>`
+- `--rundeck-job-id <id>`
+- `--rundeck-api-token-env <ENV_NAME>`
+- `--rundeck-insecure-skip-tls-verify`
+- `--bootstrap-shared-current-password`
+- `--shared-current-password-env <ENV_NAME>`
 
-### Related CLI options (configuration at runtime)
+---
 
-- `--vault-mount` (default: `secret`) for KV v2 mount name.
-- `--vault-password-key` (default: `password`) for secret field name.
-- `--job-runner` (`local` or `rundeck`) to select local racadm vs enterprise job orchestration.
-- `--password-length` and `--password-specials` for password policy tuning.
-- `--timeout` for per-host backend timeout.
-- `--bootstrap-shared-current-password` to enable bootstrap exception mode.
-- `--shared-current-password-env` to select env var name for bootstrap shared current password (default: `IDRAC_SHARED_CURRENT_PASSWORD`).
+## Input format
 
-### Rundeck Job Runner (Optional)
-
-When `--job-runner rundeck` is enabled, the tool triggers a Rundeck job per host and waits for completion instead of executing local `racadm`.
-
-Required:
-
-- `--rundeck-url`
-- `--rundeck-job-id`
-- `--rundeck-api-token-env` (defaults to `RUNDECK_API_TOKEN`)
-
-Expected Rundeck job option names:
-
-- `idrac_host`
-- `idrac_username`
-- `target_account_id`
-- `target_account_username`
-- `current_password`
-- `new_password`
-
-Optional:
-
-- `--rundeck-insecure-skip-tls-verify` for non-production TLS exceptions.
-
-## Input CSV Format
-
-Required header columns:
+Expected CSV headers in normal mode:
 
 - `idrac_host`
 - `idrac_username`
@@ -268,409 +194,307 @@ Required header columns:
 - `site`
 - `environment`
 
-In **normal mode** (default), `current_password_vault_path` is required and used.
+Bootstrap mode allows `current_password_vault_path` column to be omitted.
 
-In **bootstrap mode** (`--bootstrap-shared-current-password`), `current_password_vault_path` can be blank or omitted from CSV; it is ignored for authentication during that first rotation run.
+Validation behavior:
 
-### Sample CSV
+- Missing header(s) => validation error.
+- Empty required value(s) => validation error with row number.
+- Duplicate host (case-insensitive) => validation error.
 
-```csv
-idrac_host,idrac_username,current_password_vault_path,target_account_username,target_account_id,new_password_vault_path,site,environment
-10.20.1.15,root,idrac/prod/site-a/r740-01/current,root,2,idrac/prod/site-a/r740-01/current,dc-a,prod
-10.20.1.16,root,idrac/prod/site-a/r740-02/current,root,2,idrac/prod/site-a/r740-02/current,dc-a,prod
-10.30.4.10,root,idrac/stage/site-b/r650-01/current,root,2,idrac/stage/site-b/r650-01/current,dc-b,stage
-```
+See `sample_idrac_batch.csv` for an example dataset format.
 
-### Field Meaning
+---
 
-- `idrac_host`: iDRAC endpoint hostname or IP.
-- `idrac_username`: Administrative iDRAC login used for password-change execution.
-- `current_password_vault_path`: Vault KV path to read current password from.
-- `target_account_username`: Intended iDRAC account username being rotated (metadata/traceability).
-- `target_account_id`: iDRAC user slot/account ID used in password-change command (`iDRAC.Users.<ID>.Password`).
-- `new_password_vault_path`: Vault KV path to write new password to (often same as current path).
-- `site`: Site tag for filtering and reporting.
-- `environment`: Environment tag (`prod`, `stage`, etc.) for filtering and reporting.
+## CLI usage
 
-## CLI Usage
-
-Basic help:
+### Basic run (local racadm)
 
 ```bash
-python idrac_password_rotator.py --help
+export VAULT_ADDR="https://vault.example"
+export VAULT_TOKEN="..."
+python3 idrac_password_rotator.py \
+  --input-file sample_idrac_batch.csv \
+  --report-file reports/rotation_run
 ```
 
-### 1) Dry-run validation (no iDRAC/Vault updates)
+### Dry run
 
 ```bash
-python idrac_password_rotator.py \
+python3 idrac_password_rotator.py \
   --input-file sample_idrac_batch.csv \
   --dry-run \
-  --report-file reports/dryrun_2026-03-25
+  --report-file reports/dry_run
 ```
 
-### 2) Pilot execution with limit
+### Bootstrap mode
 
 ```bash
-python idrac_password_rotator.py \
-  --input-file batch_prod.csv \
-  --limit 5 \
-  --concurrency 2 \
-  --timeout 90 \
-  --report-file reports/pilot5
-```
-
-### 3) Production run (local racadm backend)
-
-```bash
-python idrac_password_rotator.py \
-  --input-file batch_prod.csv \
-  --concurrency 6 \
-  --timeout 90 \
-  --vault-mount secret \
-  --vault-password-key password \
-  --report-file reports/prod_full
-```
-
-### 3b) Initial bootstrap rollout run (shared current password from env)
-
-```bash
-export IDRAC_SHARED_CURRENT_PASSWORD="<shared-existing-idrac-password>"
-
-python idrac_password_rotator.py \
-  --input-file batch_initial_bootstrap.csv \
+export VAULT_ADDR="https://vault.example"
+export VAULT_TOKEN="..."
+export IDRAC_SHARED_CURRENT_PASSWORD="current-shared-password"
+python3 idrac_password_rotator.py \
+  --input-file sample_idrac_batch.csv \
   --bootstrap-shared-current-password \
-  --shared-current-password-env IDRAC_SHARED_CURRENT_PASSWORD \
-  --concurrency 6 \
-  --timeout 90 \
-  --vault-mount secret \
-  --vault-password-key password \
-  --report-file reports/bootstrap_initial
+  --report-file reports/bootstrap_run
 ```
 
-If bootstrap mode is enabled and the configured env var is missing, the tool fails fast before any host processing.
-
-### 4) Filtered run by site/environment
+### Rundeck backend mode
 
 ```bash
-python idrac_password_rotator.py \
-  --input-file batch_all_sites.csv \
-  --site-filter dc-a \
-  --environment-filter prod \
-  --report-file reports/dc-a_prod
-```
-
-### 5) Rundeck-backed execution
-
-```bash
-export RUNDECK_API_TOKEN="<rundeck-api-token>"
-
-python idrac_password_rotator.py \
-  --input-file batch_prod.csv \
-  --job-runner rundeck \
-  --rundeck-url https://rundeck.example.internal \
-  --rundeck-job-id 7b7f6d8a-0000-1111-2222-0123456789ab \
-  --rundeck-api-token-env RUNDECK_API_TOKEN \
-  --site-filter dc-a \
-  --environment-filter prod \
-  --concurrency 4 \
-  --timeout 120 \
-  --report-file reports/rundeck_dc-a_prod
-```
-
-### 6) Rundeck job-step style invocation example
-
-```bash
-python idrac_password_rotator.py \
-  --input-file "${RD_OPTION_INPUT_CSV}" \
-  --job-runner rundeck \
-  --rundeck-url "${RD_OPTION_RUNDECK_URL}" \
-  --rundeck-job-id "${RD_OPTION_RUNDECK_JOB_ID}" \
-  --rundeck-api-token-env RUNDECK_API_TOKEN \
-  --site-filter "${RD_OPTION_SITE}" \
-  --environment-filter "${RD_OPTION_ENVIRONMENT}" \
-  --report-file "${RD_JOB_LOGLEVEL:-reports}/rotation_${RD_JOB_EXECID}"
-```
-
-### 7) Simulation run (safe pre-production verification)
-
-```bash
-# Operational simulation using dry-run
-python idrac_password_rotator.py \
+export VAULT_ADDR="https://vault.example"
+export VAULT_TOKEN="..."
+export RUNDECK_API_TOKEN="..."
+python3 idrac_password_rotator.py \
   --input-file sample_idrac_batch.csv \
-  --dry-run \
-  --limit 20 \
-  --report-file reports/sim_dryrun
+  --job-runner rundeck \
+  --rundeck-url https://rundeck.example.org \
+  --rundeck-job-id <job-id> \
+  --report-file reports/rundeck_run
 ```
 
-### 8) Resume from previous report
+---
 
-```bash
-python idrac_password_rotator.py \
-  --input-file batch_prod.csv \
-  --resume-from-report reports/prod_full.json \
-  --report-file reports/prod_resume
-```
+## Reports and statuses
 
-The resume feature skips hosts already marked `SUCCESS` in prior JSON/CSV report.
+The tool writes two files using `--report-file <stem>`:
 
-## Simulation Mode
+- `<stem>.json`
+- `<stem>.csv`
 
-This project supports two practical simulation approaches:
+### JSON format
 
-1. **CLI dry-run simulation (`--dry-run`)**
-   - Validates CSV loading, filtering, reporting, and orchestration behavior.
-   - Does **not** contact Vault.
-   - Does **not** execute password-change operations.
-
-2. **Test harness simulation (pytest with stubs/mocks)**
-   - Replaces Vault and backend execution calls with controlled fake backends.
-   - Supports deterministic failure injection (e.g., racadm failure, Vault write failure after password change success).
-   - Validates status outcomes and remediation signaling.
-
-Example simulation checks:
-
-```bash
-pytest -q
-pytest -k "partial_failure or racadm_failure" -q
-```
-
-## Reports and Output
-
-Each run writes:
-
-- `<report-file>.json`
-- `<report-file>.csv`
-
-### JSON report structure
-
-Top-level keys:
+Contains:
 
 - `generated_at`
-- `summary`
-- `results` (array of per-host result objects)
+- `summary`:
+  - `total`
+  - `succeeded`
+  - `failed`
+  - `partial_failures`
+  - `skipped`
+- `results`: array of per-host result objects.
 
-### Important per-host fields
-
-- `idrac_host`: target endpoint.
-- `timestamp`: UTC processing time.
-- `status`: terminal status (`SUCCESS`, `FAILED`, etc.).
-- `idrac_password_changed`: whether password-change execution succeeded.
-- `vault_updated`: whether Vault write succeeded.
-- `sanitized_error`: masked error details safe for logs/review.
-- `remediation_note`: operator guidance for corrective action.
-- `site`, `environment`: context tags from CSV.
-
-### Stdout/log summary
-
-At end of run, summary includes counts:
-
-- `total`
-- `succeeded`
-- `failed`
-- `partial_failures`
-- `skipped`
-
-Exit codes:
-
-- `0`: no failures.
-- `1`: one or more failures.
-- `2`: one or more critical partial failures.
-
-## Status Values
-
-Current status values used by implementation:
+### Per-host status values used by code
 
 - `SUCCESS`
-  - Password changed and Vault updated successfully.
 - `FAILED`
-  - Rotation failed before full completion (Vault read issue, password policy issue, execution backend failure, timeout, etc.).
 - `CRITICAL_PARTIAL_FAILURE`
-  - Password changed, but Vault update failed. Immediate remediation required.
 - `DRY_RUN_SKIPPED`
-  - Dry-run mode; host validated in workflow but no state-changing operations executed.
 
-## Failure Handling and Recovery
+Resume behavior (`--resume-from-report`) only skips hosts with status `SUCCESS` in the prior report.
 
-### Vault read failure
+---
 
-- **Symptom**: `FAILED` with Vault read/auth/path message.
-- **Action**:
-  - Validate token permissions and TTL.
-  - Validate KV mount/path and key (`--vault-password-key`).
-  - Re-run for affected scope.
+## Vault behavior
 
-### Vault pre-flight validation failure
+### Read path behavior
 
-- **Symptom**: `CRITICAL_PARTIAL_FAILURE` after successful password change, with metadata/version/state validation error.
-- **Action**:
-  - Treat as urgent credential-state mismatch.
-  - Verify actual current secret state/version in Vault.
-  - Reconcile secret under approved break-glass/change process before retry.
+Normal mode reads current password from `current_password_vault_path`, requiring:
 
-### Backend execution failure (`racadm` or Rundeck)
+- secret exists,
+- configured password key exists and is non-empty string,
+- metadata version is present and valid.
 
-- **Symptom**: `FAILED`, `idrac_password_changed=false`, `vault_updated=false`.
-- **Action**:
-  - For local mode: check DNS/network reachability, credentials, account ID, and racadm tooling.
-  - For Rundeck mode: inspect Rundeck execution output/state and worker-node access.
-  - Reproduce manually in maintenance context if needed.
+### Pre-flight validation before write
 
-### Timeout
+Before writing to `new_password_vault_path`, code checks Vault metadata state:
 
-- **Symptom**: `FAILED` with timeout text.
-- **Action**:
-  - Increase `--timeout` for slow networks/external job latency.
-  - Reduce `--concurrency` to avoid saturation.
-  - Retry affected subset.
+- metadata can be read (or path missing under allowed conditions),
+- `current_version` is valid,
+- if expected version is provided, it matches current version,
+- latest version is not deleted/destroyed.
 
-### Vault write failure after successful password change
+Expected version is currently enforced only for in-place rotations (`new_password_vault_path == current_password_vault_path`).
 
-- **Symptom**: `CRITICAL_PARTIAL_FAILURE`, `idrac_password_changed=true`, `vault_updated=false`.
-- **Action (urgent)**:
-  1. Open incident/change exception immediately.
-  2. Confirm new iDRAC credential via controlled access.
-  3. Update Vault path with verified credential under break-glass procedure.
-  4. Record remediation evidence and close incident.
+### Write behavior
 
-### Rundeck operator interpretation
+- Reads existing secret data if present.
+- Merges existing data with new password field.
+- Uses KV v2 `create_or_update_secret` with `cas`:
+  - `cas=version` for existing secret,
+  - `cas=0` when path is absent.
 
-- Non-zero CLI exit means the run needs investigation:
-  - `1`: one or more hosts failed (no confirmed split-state event).
-  - `2`: at least one critical partial failure (password changed but Vault not updated).
-- For orchestrated jobs, map non-zero exit to alerting/escalation policy in Rundeck.
+---
 
-### Resume behavior
+## racadm behavior and environment-specific assumptions
 
-- Use `--resume-from-report` with prior JSON/CSV report to skip hosts that already reached `SUCCESS`.
-- Partial failures and failures remain eligible for retry after remediation.
+Local backend command shape is:
+
+```bash
+racadm -r <idrac_host> -u <idrac_username> -p <current_password> \
+  set iDRAC.Users.<target_account_id>.Password <new_password>
+```
+
+Result evaluation in current code:
+
+- success requires `returncode == 0`, and
+- combined stdout/stderr must not contain markers: `ERROR`, `FAIL`, `INVALID`, `UNAUTHORIZED`.
+
+Important assumptions to validate in target environment:
+
+- `racadm` command syntax may vary by firmware/tooling version.
+- Account ID mapping (`target_account_id`) must match iDRAC local user model.
+- Network reachability and TLS behavior for iDRAC endpoints are external dependencies.
+
+---
+
+## Pre-flight validation behavior
+
+Pre-flight validation is implemented in Vault write path and is not a separate global stage.
+
+What it does:
+
+- validates target secret metadata and writable state immediately before update,
+- detects version drift when in-place rotation expects a specific version,
+- blocks writes when latest version state is deleted/destroyed.
+
+What it does not appear to do:
+
+- does not correlate versions across different read/write paths,
+- does not perform a standalone “validate all hosts then execute” two-phase workflow.
+
+---
+
+## Rundeck execution model
+
+With `--job-runner rundeck`, the tool:
+
+1. Calls Rundeck `POST /api/41/job/<job_id>/run` with per-host options:
+   `idrac_host`, `idrac_username`, `target_account_id`, `target_account_username`, `current_password`, `new_password`.
+2. Polls `GET /api/41/execution/<execution_id>/state` every ~2 seconds.
+3. Treats `SUCCEEDED` as success and `FAILED|ABORTED|TIMEDOUT` as failure.
+4. On success, continues with Vault write in this CLI.
+
+Notes:
+
+- This CLI still owns Vault read/write and reporting.
+- `--rundeck-insecure-skip-tls-verify` disables TLS verification for Rundeck API calls.
+
+---
+
+## Failure handling and recovery
+
+### Failure classes
+
+- `FAILED`: iDRAC change failed, Vault unchanged.
+- `CRITICAL_PARTIAL_FAILURE`: iDRAC changed but Vault update failed.
+
+### Recovery mechanisms implemented
+
+- Resume only skips previous `SUCCESS` hosts.
+- `--fail-fast` stops after first failed/partial-failure host (sequential mode).
+- Non-fail-fast mode processes all selected hosts and reports all outcomes.
+
+### Operational implication
+
+`CRITICAL_PARTIAL_FAILURE` indicates credential drift and requires urgent manual remediation of Vault state and access processes.
+
+---
 
 ## Testing
 
-Run test suite:
+Repository includes unit tests in `tests/test_idrac_password_rotator.py` that cover:
+
+- CSV validation behavior.
+- Password policy generation basics.
+- Successful and failed per-host flows.
+- Partial failure semantics.
+- Bootstrap-specific behavior.
+- Fail-fast behavior.
+- Rundeck token requirement check.
+
+Tests use stubs/mocks for Vault and command runners; they do not perform real racadm/Vault/Rundeck integration.
+
+Run:
 
 ```bash
 pytest -q
 ```
 
-What is covered:
+---
 
-- CSV validation (including duplicate host rejection).
-- Password generation policy baseline checks.
-- Successful end-to-end per-host flow with mocked dependencies.
-- Backend failure handling.
-- Critical partial failure handling when Vault write fails post-change.
-- Dry-run per-host behavior.
-- Fail-fast orchestration behavior.
+## Security considerations before making this repository public
 
-Mocking strategy:
+This repository is close to publishable, but review these items first.
 
-- Vault operations are replaced with in-memory stub classes.
-- Backend execution is replaced with fake runner responses.
-- No real Vault or iDRAC calls are needed for unit tests.
+1. **Sample data hygiene**
+   - `sample_idrac_batch.csv` contains private-style naming patterns and network-like addressing.
+   - Confirm all sample hosts, Vault paths, sites, and environments are synthetic and acceptable for public exposure.
 
-Safe validation before production:
+2. **Vault path conventions**
+   - Sample/test paths reveal naming structure (`idrac/<env>/<site>/<host>/current`).
+   - Decide whether to keep, generalize, or redact these conventions.
 
-1. Run unit tests.
-2. Run CLI with `--dry-run` on real CSV.
-3. Execute pilot on small host set with live dependencies.
+3. **Report artifact handling**
+   - Generated reports include host identifiers, site/environment tags, and sanitized error text.
+   - Ensure no real production reports are committed; keep `.gitignore` and CI artifact policies strict.
 
-## Pilot Rollout Guidance
+4. **Rundeck integration metadata**
+   - Confirm no real Rundeck URLs/job IDs/tokens appear in docs, examples, CI, or scripts.
 
-Recommended rollout sequence:
+5. **Fixtures and tests**
+   - Test fixtures currently appear synthetic; re-check periodically before publishing snapshots.
 
-1. **Dry-run first** on full intended CSV to validate schema/filter/report behavior.
-2. **Simulation tests** (`pytest`) to validate expected failure handling paths.
-3. **Pilot with 5 servers** (`--limit 5`, low concurrency).
-4. **Expand to ~20 servers** after successful pilot and report review.
-5. **Proceed to full batch** during approved maintenance/change window.
+6. **Secret handling expectations**
+   - Tool avoids logging cleartext secrets, but still transmits passwords to racadm/Rundeck backends.
+   - Validate runtime logging, job option redaction, and process visibility controls in your environment.
 
-Why this matters:
+---
 
-- Reduces blast radius.
-- Validates environment-specific iDRAC/Vault behavior before full rollout.
-- Ensures team readiness for partial-failure remediation.
+## Public-repository readiness checklist
 
-## Security Considerations
+Before publishing, explicitly review:
 
-- Secret values are never intentionally logged; output is sanitized before persistence.
-- Pre-flight Vault validation helps enforce safer secret lifecycle handling by checking metadata/state before write.
-- Do not hardcode credentials in code, CSV, or shell history.
-- Use least-privilege Vault token scoped only to required KV paths and operations.
-- Prefer short-lived tokens and controlled execution context.
-- If using Rundeck:
-  - store tokens/secrets in secure key storage,
-  - avoid printing env vars/options containing secrets,
-  - restrict job and node permissions by least privilege,
-  - control who can view job logs and artifacts.
-- Protect input CSV and report artifacts (`*.json`, `*.csv`) because they contain host inventory and operational metadata.
-- In job-runner environments, ensure artifact paths and retention policies follow internal data-handling requirements.
-- Validate exact local `racadm` command syntax in a lab environment before production.
-- Confirm generated password policy aligns with active Dell iDRAC firmware complexity rules.
-- Restrict who can run this tool and access result artifacts.
+- `sample_idrac_batch.csv` for real hostnames/IPs or internal taxonomy leakage.
+- Any committed `*.json` / `*.csv` reports from previous runs (should not exist).
+- README examples for internal URLs, Vault mount/path conventions, or environment names.
+- CI/CD configs (if later added) for hardcoded Vault/Rundeck references.
+- Issue templates/wiki/docs for screenshots or run logs containing host IDs.
 
-## Known Assumptions and Environment-Specific Validation
+The current implementation appears to be intentionally careful about secrets in logs, but operational metadata still needs governance.
 
-Before production, validate these assumptions explicitly:
+---
 
-1. **racadm syntax compatibility (local mode)**
-   - Command format for your firmware/tooling matches implementation (`set iDRAC.Users.<ID>.Password ...`).
-2. **Vault KV v2 semantics**
-   - Target mount is KV v2 and supports metadata and CAS behavior as expected.
-3. **iDRAC account ID behavior**
-   - `target_account_id` maps correctly to intended user slot across hardware generations.
-4. **Password policy compatibility**
-   - Generated length/special character set are accepted by all target iDRAC versions.
-5. **Network and timeout envelope**
-   - Execution host can reach Vault and, depending on backend, iDRAC endpoints or Rundeck API.
-6. **Concurrency tolerance**
-   - `--concurrency` does not overwhelm network devices, iDRAC interfaces, Vault, or Rundeck execution capacity.
+## Limitations and assumptions
+
+- The current implementation assumes Vault KV v2 semantics and `hvac` compatibility.
+- The current implementation assumes a working `racadm` CLI with the coded command format.
+- Concurrency shares a single Vault client across worker threads; validate this under production load.
+- Sanitization is broad string replacement and truncation; it reduces but does not formally guarantee zero secret leakage.
+- Rundeck API version path is hardcoded to `/api/41`; validate against your Rundeck version.
+- `target_account_username` is carried through CSV/options payload but local racadm path currently uses account ID for password set command.
+
+---
 
 ## Troubleshooting
 
-- **`CSV validation error` at startup**
-  - Check header names and required non-empty fields.
-  - Ensure no duplicate `idrac_host` values.
+- **`VAULT_ADDR must be set` / `VAULT_TOKEN must be set`**:
+  - Set required env vars for non-dry-run execution.
 
-- **Vault pre-flight validation failure before write**
-  - Verify target path metadata is accessible and writable.
-  - Check for deleted/destroyed latest secret version.
-  - Confirm no concurrent process updated the same path if in-place rotation is used.
+- **`Vault authentication failed`**:
+  - Validate token, namespace, and network path to Vault.
 
-- **Vault version/state mismatch (`expected ... observed ...`)**
-  - Another process may have updated the same secret between read and write.
-  - Re-read latest secret state and re-run controlled rotation for that host.
+- **`Vault path not found` / missing password key**:
+  - Verify input path and `--vault-password-key` match actual secret schema.
 
-- **`Vault authentication failed`**
-  - Validate `VAULT_ADDR`, `VAULT_TOKEN`, and optional `VAULT_NAMESPACE`.
-  - Confirm token policy and namespace scope.
+- **`racadm binary not found in PATH`**:
+  - Install racadm/OpenManage tooling on execution host.
 
-- **Rundeck environment variable issues**
-  - Confirm token env var name matches `--rundeck-api-token-env`.
-  - Ensure Rundeck job securely injects variables into the CLI process environment.
+- **Hosts marked `CRITICAL_PARTIAL_FAILURE`**:
+  - Treat as urgent drift; reconcile Vault to actual iDRAC credential state before further automation.
 
-- **Missing file paths in Rundeck-run context**
-  - Use absolute paths for `--input-file` and `--report-file` when job working directory is not guaranteed.
-  - Validate that runner node has access to mounted storage locations.
+- **Rundeck token error when using Rundeck backend**:
+  - Ensure token env var named by `--rundeck-api-token-env` is populated.
 
-- **Report path permission problems in job-runner environments**
-  - Ensure CLI process user can create parent directories/write report files.
-  - Route reports to approved writable artifact directories.
+---
 
-- **`racadm binary not found in PATH` (local mode)**
-  - Install/enable RACADM tooling and verify with `which racadm`.
+## Contributing / future improvements
 
-- **Frequent backend timeouts/failures**
-  - Lower concurrency, increase timeout, and verify network ACL/firewall paths.
+Potential improvements based on current code shape:
 
-## Future Improvements
-
-Potential enhancements for enterprise adoption (beyond the currently implemented Vault pre-flight checks and Rundeck runner support):
-
-- Vault AppRole/JWT/OIDC auth support (reducing static token usage).
-- Cross-process lock/coordination patterns for very high-concurrency rotations.
-- Standardized Rundeck job-option templates and project defaults.
-- Approval workflow integration for high-sensitivity production scopes.
-- Scheduled rotation policy packs tied to environment/site governance.
-- Metrics export (Prometheus/OpenTelemetry) for run observability.
-- Optional encrypted-at-rest report outputs.
+- Add integration tests against disposable Vault + mocked racadm service.
+- Add optional retry/backoff policies for transient network/API failures.
+- Add structured machine-readable error codes in reports.
+- Add optional per-host checkpointing independent of report parsing.
+- Add explicit redaction tests for sanitization behavior.
