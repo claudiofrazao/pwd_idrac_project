@@ -1,0 +1,48 @@
+title = "Public repo pre-release scan"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Global allowlist for known safe placeholders"
+paths = [
+  '''^docs/''',
+]
+regexes = [
+  '''(?i)example''',
+  '''(?i)changeme''',
+  '''(?i)your[_-]?token''',
+  '''(?i)your[_-]?password''',
+  '''(?i)dummy''',
+  '''(?i)placeholder''',
+]
+
+[[rules]]
+id = "internal-vault-path"
+description = "Potential internal Vault path"
+regex = '''(?i)(secret/data/|kv/data/|vault/)[A-Za-z0-9/_\.-]+'''
+tags = ["internal", "vault", "proprietary"]
+
+[[rules]]
+id = "internal-hostname-pattern"
+description = "Potential internal hostname or iDRAC naming"
+regex = '''(?i)\b(idrac|ilo|bmc|corp|prod|nonprod|stg|dev)-[A-Za-z0-9._-]+\b'''
+tags = ["internal", "hostname", "proprietary"]
+
+[[rules]]
+id = "rundeck-job-reference"
+description = "Potential Rundeck internal reference"
+regex = '''(?i)\b(rundeck|jobref|job-reference|project:)\b'''
+tags = ["internal", "rundeck"]
+
+[[rules]]
+id = "private-ip-address"
+description = "Private IPv4 address"
+regex = '''\b(?:10\.\d{1,3}\.\d{1,3}\.\d{1,3}|192\.168\.\d{1,3}\.\d{1,3}|172\.(?:1[6-9]|2\d|3[0-1])\.\d{1,3}\.\d{1,3})\b'''
+tags = ["internal", "network"]
+
+[[rules]]
+id = "corp-email"
+description = "Possible corporate email"
+regex = '''\b[A-Za-z0-9._%+-]+@(?:corp|internal|examplecorp|company)\.[A-Za-z]{2,}\b'''
+tags = ["internal", "email"]
