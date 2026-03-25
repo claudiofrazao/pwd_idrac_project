@@ -21,6 +21,7 @@ The tool is intentionally designed so Vault is updated **only after** a successf
 - Resume support (`--resume-from-report`) to skip prior successful hosts.
 - Explicit partial-failure detection (`CRITICAL_PARTIAL_FAILURE`) when iDRAC changes but Vault update fails.
 - Sanitized, audit-friendly logging that avoids secret disclosure.
+- Explicit **bootstrap exception mode** for first-run rotations when current passwords are not yet in Vault.
 
 ## Architecture Summary
 
@@ -38,7 +39,7 @@ Main components:
 Per-server workflow (high level):
 
 1. Validate server row from CSV.
-2. Read current password from Vault.
+2. Read current password from Vault (normal mode) **or** use shared runtime password (bootstrap mode).
 3. Generate a new password in memory.
 4. Execute `racadm` password change.
 5. If `racadm` succeeds, write new password to Vault.
@@ -55,6 +56,26 @@ The intended safe sequence is:
 5. **If Vault update fails after iDRAC success, mark `CRITICAL_PARTIAL_FAILURE`** and trigger urgent remediation.
 
 This sequence is the core control that reduces drift while still surfacing high-risk split-brain conditions.
+
+## Bootstrap Exception Mode (Initial Rollout Only)
+
+Use bootstrap mode only for the first rollout when:
+
+- all target iDRACs still share the same current password, and
+- current passwords are not yet stored in Vault.
+
+When bootstrap mode is enabled:
+
+1. The tool does **not** read `current_password_vault_path` per server from Vault.
+2. It reads one shared current password from an environment variable at runtime.
+3. It still generates a unique new password per server.
+4. It still writes each new password to that server's `new_password_vault_path` after successful `racadm`.
+5. If `racadm` fails, no Vault write occurs.
+6. If Vault write fails after successful `racadm`, status is `CRITICAL_PARTIAL_FAILURE` with remediation guidance.
+
+> Security note: do not pass shared passwords as direct CLI values. Prefer env vars so secrets are not exposed in shell history/process lists.
+
+After the initial bootstrap rotation completes, migrate immediately back to the standard per-server Vault-read mode.
 
 ## Project Structure
 
@@ -119,6 +140,8 @@ export VAULT_NAMESPACE="infrastructure/operations"
 - `--vault-password-key` (default: `password`) for secret field name.
 - `--password-length` and `--password-specials` for password policy tuning.
 - `--timeout` for per-host `racadm` timeout.
+- `--bootstrap-shared-current-password` to enable bootstrap exception mode.
+- `--shared-current-password-env` to select env var name for bootstrap shared current password (default: `IDRAC_SHARED_CURRENT_PASSWORD`).
 
 ## Input CSV Format
 
@@ -132,6 +155,10 @@ Required header columns:
 - `new_password_vault_path`
 - `site`
 - `environment`
+
+In **normal mode** (default), `current_password_vault_path` is required and used.
+
+In **bootstrap mode** (`--bootstrap-shared-current-password`), `current_password_vault_path` can be blank or omitted from CSV; it is ignored for authentication during that first rotation run.
 
 ### Sample CSV
 
@@ -192,6 +219,24 @@ python idrac_password_rotator.py \
   --vault-password-key password \
   --report-file reports/prod_full
 ```
+
+### 3b) Initial bootstrap rollout run (shared current password from env)
+
+```bash
+export IDRAC_SHARED_CURRENT_PASSWORD="<shared-existing-idrac-password>"
+
+python idrac_password_rotator.py \
+  --input-file batch_initial_bootstrap.csv \
+  --bootstrap-shared-current-password \
+  --shared-current-password-env IDRAC_SHARED_CURRENT_PASSWORD \
+  --concurrency 6 \
+  --timeout 90 \
+  --vault-mount secret \
+  --vault-password-key password \
+  --report-file reports/bootstrap_initial
+```
+
+If bootstrap mode is enabled and the configured env var is missing, the tool fails fast before any host processing.
 
 ### 4) Filtered run by site/environment
 

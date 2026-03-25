@@ -36,10 +36,9 @@ from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tupl
 import hvac
 from hvac.exceptions import InvalidPath, VaultError
 
-REQUIRED_COLUMNS: Tuple[str, ...] = (
+BASE_REQUIRED_COLUMNS: Tuple[str, ...] = (
     "idrac_host",
     "idrac_username",
-    "current_password_vault_path",
     "target_account_username",
     "target_account_id",
     "new_password_vault_path",
@@ -144,10 +143,23 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     parser.add_argument("--environment-filter", default=None, help="Only process matching environment value")
     parser.add_argument("--password-specials", default=DEFAULT_PASSWORD_SPECIALS, help="Allowed special chars")
     parser.add_argument("--vault-password-key", default="password", help="Field name in Vault secret data")
+    parser.add_argument(
+        "--bootstrap-shared-current-password",
+        action="store_true",
+        help=(
+            "Bootstrap exception mode: use one shared current iDRAC password from env for all "
+            "hosts, instead of reading current_password_vault_path per host from Vault."
+        ),
+    )
+    parser.add_argument(
+        "--shared-current-password-env",
+        default="IDRAC_SHARED_CURRENT_PASSWORD",
+        help="Environment variable name that contains shared current iDRAC password in bootstrap mode.",
+    )
     return parser.parse_args(argv)
 
 
-def parse_csv(path: Path) -> List[ServerRecord]:
+def parse_csv(path: Path, *, bootstrap_shared_current_password: bool = False) -> List[ServerRecord]:
     if not path.exists():
         raise CsvValidationError(f"Input file does not exist: {path}")
 
@@ -155,15 +167,21 @@ def parse_csv(path: Path) -> List[ServerRecord]:
         reader = csv.DictReader(handle)
         if reader.fieldnames is None:
             raise CsvValidationError("CSV has no header row")
-        missing_columns = [c for c in REQUIRED_COLUMNS if c not in reader.fieldnames]
+        required_columns = list(BASE_REQUIRED_COLUMNS)
+        if not bootstrap_shared_current_password:
+            required_columns.append("current_password_vault_path")
+        missing_columns = [c for c in required_columns if c not in reader.fieldnames]
         if missing_columns:
             raise CsvValidationError(f"CSV missing required columns: {', '.join(missing_columns)}")
 
         records: List[ServerRecord] = []
         seen_hosts: Set[str] = set()
         for idx, row in enumerate(reader, start=2):
-            normalized = {k: (row.get(k) or "").strip() for k in REQUIRED_COLUMNS}
+            normalized = {k: (row.get(k) or "").strip() for k in BASE_REQUIRED_COLUMNS}
+            normalized["current_password_vault_path"] = (row.get("current_password_vault_path") or "").strip()
             missing_fields = [k for k, v in normalized.items() if not v]
+            if bootstrap_shared_current_password:
+                missing_fields = [k for k in missing_fields if k != "current_password_vault_path"]
             if missing_fields:
                 raise CsvValidationError(
                     f"Row {idx} missing required value(s): {', '.join(missing_fields)}"
@@ -405,6 +423,7 @@ def process_one_server(
     password_length: int,
     password_specials: str,
     vault_client: Optional[VaultKv2Client],
+    shared_current_password: Optional[str] = None,
     racadm_runner: Callable[..., subprocess.CompletedProcess[str]] = subprocess.run,
 ) -> RotationResult:
     logging.info("Processing host=%s site=%s env=%s", record.idrac_host, record.site, record.environment)
@@ -424,15 +443,17 @@ def process_one_server(
             remediation_note="Initialize Vault client or use --dry-run.",
         )
 
-    try:
-        current_password = vault_client.read_password(record.current_password_vault_path)
-    except Exception as exc:
-        return make_result(
-            record,
-            status="FAILED",
-            sanitized_error=sanitize_text(str(exc)),
-            remediation_note="Verify Vault path/auth and secret key availability.",
-        )
+    current_password = shared_current_password
+    if current_password is None:
+        try:
+            current_password = vault_client.read_password(record.current_password_vault_path)
+        except Exception as exc:
+            return make_result(
+                record,
+                status="FAILED",
+                sanitized_error=sanitize_text(str(exc)),
+                remediation_note="Verify Vault path/auth and secret key availability.",
+            )
 
     try:
         new_password = generate_password(length=password_length, specials=password_specials)
@@ -566,7 +587,23 @@ def orchestrate(args: argparse.Namespace) -> int:
     if args.timeout < 1:
         raise ValueError("--timeout must be >= 1")
 
-    records = parse_csv(Path(args.input_file))
+    bootstrap_mode = bool(getattr(args, "bootstrap_shared_current_password", False))
+    shared_password_env_name = str(
+        getattr(args, "shared_current_password_env", "IDRAC_SHARED_CURRENT_PASSWORD")
+    )
+    records = parse_csv(
+        Path(args.input_file),
+        bootstrap_shared_current_password=bootstrap_mode,
+    )
+
+    shared_current_password: Optional[str] = None
+    if bootstrap_mode:
+        env_name = shared_password_env_name
+        shared_current_password = os.getenv(env_name)
+        if not shared_current_password:
+            raise ValueError(
+                f"Bootstrap mode requires environment variable '{env_name}' to be set with the shared current password."
+            )
 
     resume_success: Set[str] = set()
     if args.resume_from_report:
@@ -614,6 +651,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                 password_length=args.password_length,
                 password_specials=args.password_specials,
                 vault_client=vault_client,
+                shared_current_password=shared_current_password,
             )
             results.append(result)
             if result.status in {"FAILED", "CRITICAL_PARTIAL_FAILURE"}:
@@ -633,6 +671,7 @@ def orchestrate(args: argparse.Namespace) -> int:
                     password_length=args.password_length,
                     password_specials=args.password_specials,
                     vault_client=vault_client,
+                    shared_current_password=shared_current_password,
                 )
                 future_to_record[future] = record
 

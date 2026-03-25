@@ -37,8 +37,10 @@ class StubVault:
         self.read_pw = read_pw
         self.fail_write = fail_write
         self.writes = []
+        self.read_calls = 0
 
     def read_password(self, path: str) -> str:
+        self.read_calls += 1
         return self.read_pw
 
     def write_password(self, path: str, new_password: str) -> None:
@@ -99,6 +101,31 @@ def test_success_flow() -> None:
     assert result.idrac_password_changed
     assert result.vault_updated
     assert len(vault.writes) == 1
+    assert vault.read_calls == 1
+
+
+def test_bootstrap_success_flow_uses_shared_password_and_writes_vault() -> None:
+    def fake_runner(cmd, **kwargs):
+        assert cmd[6] == "SharedCurrent!234"
+        return rot.subprocess.CompletedProcess(args=[], returncode=0, stdout="OK", stderr="")
+
+    record = mk_record()
+    vault = StubVault(read_pw="should-not-be-used")
+    result = rot.process_one_server(
+        record=record,
+        dry_run=False,
+        timeout_seconds=5,
+        password_length=16,
+        password_specials="!@#",
+        vault_client=vault,
+        shared_current_password="SharedCurrent!234",
+        racadm_runner=fake_runner,
+    )
+    assert result.status == "SUCCESS"
+    assert result.idrac_password_changed
+    assert result.vault_updated
+    assert len(vault.writes) == 1
+    assert vault.read_calls == 0
 
 
 def test_racadm_failure_flow() -> None:
@@ -120,6 +147,28 @@ def test_racadm_failure_flow() -> None:
     assert not result.vault_updated
 
 
+def test_bootstrap_racadm_failure_has_no_vault_write() -> None:
+    def fake_runner(*args, **kwargs):
+        return rot.subprocess.CompletedProcess(args=[], returncode=1, stdout="", stderr="ERROR")
+
+    record = mk_record()
+    vault = StubVault()
+    result = rot.process_one_server(
+        record=record,
+        dry_run=False,
+        timeout_seconds=5,
+        password_length=16,
+        password_specials="!@#",
+        vault_client=vault,
+        shared_current_password="SharedCurrent!234",
+        racadm_runner=fake_runner,
+    )
+    assert result.status == "FAILED"
+    assert not result.vault_updated
+    assert len(vault.writes) == 0
+    assert vault.read_calls == 0
+
+
 def test_partial_failure_vault_write() -> None:
     def fake_runner(*args, **kwargs):
         return rot.subprocess.CompletedProcess(args=[], returncode=0, stdout="OK", stderr="")
@@ -138,6 +187,72 @@ def test_partial_failure_vault_write() -> None:
     assert result.status == "CRITICAL_PARTIAL_FAILURE"
     assert result.idrac_password_changed
     assert not result.vault_updated
+
+
+def test_bootstrap_partial_failure_vault_write() -> None:
+    def fake_runner(*args, **kwargs):
+        return rot.subprocess.CompletedProcess(args=[], returncode=0, stdout="OK", stderr="")
+
+    record = mk_record()
+    vault = StubVault(fail_write=True)
+    result = rot.process_one_server(
+        record=record,
+        dry_run=False,
+        timeout_seconds=5,
+        password_length=16,
+        password_specials="!@#",
+        vault_client=vault,
+        shared_current_password="SharedCurrent!234",
+        racadm_runner=fake_runner,
+    )
+    assert result.status == "CRITICAL_PARTIAL_FAILURE"
+    assert result.idrac_password_changed
+    assert not result.vault_updated
+    assert "manual" in result.remediation_note.lower()
+
+
+def test_csv_bootstrap_allows_missing_current_password_vault_path_column(tmp_path: Path) -> None:
+    p = tmp_path / "in.csv"
+    p.write_text(
+        "idrac_host,idrac_username,target_account_username,target_account_id,new_password_vault_path,site,environment\n"
+        "h1,root,root,2,b,dc1,prod\n",
+        encoding="utf-8",
+    )
+    rows = rot.parse_csv(p, bootstrap_shared_current_password=True)
+    assert len(rows) == 1
+
+
+def test_orchestrate_bootstrap_missing_env_var_fails_fast(monkeypatch, tmp_path: Path) -> None:
+    csv_path = tmp_path / "in.csv"
+    csv_path.write_text(
+        "idrac_host,idrac_username,target_account_username,target_account_id,new_password_vault_path,site,environment\n"
+        "h1,root,root,2,b,dc1,prod\n",
+        encoding="utf-8",
+    )
+
+    args = SimpleNamespace(
+        input_file=str(csv_path),
+        dry_run=False,
+        limit=None,
+        concurrency=1,
+        timeout=30,
+        verbose=False,
+        report_file=str(tmp_path / "report"),
+        resume_from_report=None,
+        password_length=16,
+        vault_mount="secret",
+        fail_fast=False,
+        site_filter=None,
+        environment_filter=None,
+        password_specials="!@#",
+        vault_password_key="password",
+        bootstrap_shared_current_password=True,
+        shared_current_password_env="IDRAC_SHARED_CURRENT_PASSWORD",
+    )
+
+    monkeypatch.delenv("IDRAC_SHARED_CURRENT_PASSWORD", raising=False)
+    with pytest.raises(ValueError, match="Bootstrap mode requires environment variable"):
+        rot.orchestrate(args)
 
 
 def test_process_dry_run_without_vault_client() -> None:
