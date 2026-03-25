@@ -411,49 +411,6 @@ Run:
 ```bash
 pytest -q
 ```
-
----
-
-## Security considerations before making this repository public
-
-This repository is close to publishable, but review these items first.
-
-1. **Sample data hygiene**
-   - `sample_idrac_batch.csv` contains private-style naming patterns and network-like addressing.
-   - Confirm all sample hosts, Vault paths, sites, and environments are synthetic and acceptable for public exposure.
-
-2. **Vault path conventions**
-   - Sample/test paths reveal naming structure (`idrac/<env>/<site>/<host>/current`).
-   - Decide whether to keep, generalize, or redact these conventions.
-
-3. **Report artifact handling**
-   - Generated reports include host identifiers, site/environment tags, and sanitized error text.
-   - Ensure no real production reports are committed; keep `.gitignore` and CI artifact policies strict.
-
-4. **Rundeck integration metadata**
-   - Confirm no real Rundeck URLs/job IDs/tokens appear in docs, examples, CI, or scripts.
-
-5. **Fixtures and tests**
-   - Test fixtures currently appear synthetic; re-check periodically before publishing snapshots.
-
-6. **Secret handling expectations**
-   - Tool avoids logging cleartext secrets, but still transmits passwords to racadm/Rundeck backends.
-   - Validate runtime logging, job option redaction, and process visibility controls in your environment.
-
----
-
-## Public-repository readiness checklist
-
-Before publishing, explicitly review:
-
-- `sample_idrac_batch.csv` for real hostnames/IPs or internal taxonomy leakage.
-- Any committed `*.json` / `*.csv` reports from previous runs (should not exist).
-- README examples for internal URLs, Vault mount/path conventions, or environment names.
-- CI/CD configs (if later added) for hardcoded Vault/Rundeck references.
-- Issue templates/wiki/docs for screenshots or run logs containing host IDs.
-
-The current implementation appears to be intentionally careful about secrets in logs, but operational metadata still needs governance.
-
 ---
 
 ## Limitations and assumptions
